@@ -130,10 +130,11 @@ class MambaActor(nn.Module):
         state_expanded = state_embed.unsqueeze(0).expand(batch_size, -1)
         combined_embeds = vehicle_embeds + state_expanded
         
-        # Process through Mamba layers
-        x = combined_embeds
+        # Add sequence dimension for Mamba: (batch, dim) -> (1, batch, dim)
+        x = combined_embeds.unsqueeze(0)  # shape: (1, batch, d_model)
         for mamba_layer in self.mamba_layers:
             x = mamba_layer(x)
+        x = x.squeeze(0)  # shape: (batch, d_model)
         
         # Generate selection probabilities
         logits = self.action_head(x).squeeze(-1)
@@ -191,10 +192,11 @@ class MambaCritic(nn.Module):
         state_expanded = state_embed.unsqueeze(0).expand(batch_size, -1)
         combined_embeds = vehicle_embeds + state_expanded
         
-        # Process through Mamba layers
-        x = combined_embeds
+        # Add sequence dimension for Mamba: (batch, dim) -> (1, batch, dim)
+        x = combined_embeds.unsqueeze(0)  # shape: (1, batch, d_model)
         for mamba_layer in self.mamba_layers:
             x = mamba_layer(x)
+        x = x.squeeze(0)  # shape: (batch, d_model)
         
         # Pool vehicle representations
         x = torch.mean(x, dim=0)
@@ -258,10 +260,20 @@ class StreamingMambaScheduler:
                 
             # Normalize probabilities for remaining vehicles
             probs = selection_probs[remaining_indices]
-            probs = probs / probs.sum()
-            
-            # Sample based on probabilities
-            idx = np.random.choice(len(remaining_indices), p=probs.cpu().numpy())
+            probs_sum = probs.sum().item()
+            probs_np = probs.cpu().numpy()
+
+            # Check for invalid probabilities (sum==0, NaN, or not close to 1 after normalization)
+            if probs_sum == 0 or np.isnan(probs_np).any():
+                idx = np.random.choice(len(remaining_indices))
+            else:
+                probs = probs / probs_sum
+                probs_np = probs.cpu().numpy()
+                if not np.isclose(probs_np.sum(), 1.0):
+                    idx = np.random.choice(len(remaining_indices))
+                else:
+                    idx = np.random.choice(len(remaining_indices), p=probs_np)
+
             selected_idx = remaining_indices[idx]
             selected_indices.append(selected_idx)
             remaining_indices.remove(selected_idx)

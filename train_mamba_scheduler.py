@@ -260,8 +260,9 @@ def evaluate(model_path, num_episodes=10):
     # Initialize models
     vehicle_feature_dim = 6
     global_state_dim = 6
-    
-    actor = MambaActor(vehicle_feature_dim, global_state_dim).to(device)
+
+    # Use the same architecture as in training
+    actor = MambaActor(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=3).to(device)
     actor.load_state_dict(checkpoint['actor_state_dict'])
     actor.eval()
     
