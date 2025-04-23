@@ -67,9 +67,10 @@ def train(num_episodes=1000, gamma=0.99, lr_actor=3e-4, lr_critic=1e-3, print_in
     vehicle_feature_dim = 6  # model_version, sojourn_time, compute_capacity, data_quality, connectivity, type
     global_state_dim = 6     # current_model_performance, round_number, elapsed_time, scheduled_count, target_count, performance_gap
 
-    actor = MambaActor(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=3, d_state=16).to(device)
-    critic = MambaCritic(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=2, d_state=16).to(device)
-
+    #actor = MambaActor(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=3, d_state=16).to(device)
+    #critic = MambaCritic(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=2, d_state=16).to(device)
+    actor = MambaActor(vehicle_feature_dim, global_state_dim, d_model=128, n_layers=2, d_state=16).to(device)
+    critic = MambaCritic(vehicle_feature_dim, global_state_dim, d_model=128, n_layers=2, d_state=16).to(device)
     # Initialize optimizers
     optimizer_actor = torch.optim.Adam(actor.parameters(), lr=lr_actor)
     optimizer_critic = torch.optim.Adam(critic.parameters(), lr=lr_critic)
