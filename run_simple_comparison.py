@@ -1,0 +1,245 @@
+# -*- coding: utf-8 -*-
+"""
+Simple comparison script for evaluating Mamba scheduler against a random baseline
+"""
+
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import random
+from datetime import datetime
+
+# Import schedulers
+from mamba_scheduler import MambaActor, OptimizedMambaScheduler, Vehicle, GlobalState
+from vehicle_env import VehicleModelUpdateEnv
+
+# Set device
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Create output directory
+output_dir = "scheduler_comparison_results"
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+
+# Wrapper class for Mamba scheduler to match comparison interface
+class MambaSchedulerWrapper:
+    def __init__(self, model_path):
+        self.scheduler = OptimizedMambaScheduler(model_path)
+        self.global_state = GlobalState()
+        
+    def select_vehicles(self, vehicles, target_count=10):
+        # Convert environment vehicles to scheduler vehicles
+        scheduler_vehicles = []
+        for v in vehicles:
+            if not v['scheduled']:
+                vehicle = Vehicle(
+                    vehicle_id=v['vehicle_id'],
+                    model_version=v['model_version'],
+                    sojourn_time=v['sojourn_time'],
+                    compute_capacity=v['compute_capacity'],
+                    data_quality=v['data_quality'],
+                    connectivity=v['connectivity'],
+                    vehicle_type=v['vehicle_type']
+                )
+                scheduler_vehicles.append(vehicle)
+        
+        # Update global state based on environment
+        # (In a real comparison, this would be updated from the environment)
+        
+        # Make scheduling decision
+        selected_vehicles = self.scheduler.inference_mode_scheduling(
+            scheduler_vehicles, self.global_state, target_count
+        )
+        
+        # Convert back to environment vehicle format
+        return [v for v in vehicles if v['vehicle_id'] in [sv.vehicle_id for sv in selected_vehicles]]
+
+# Random scheduler (baseline)
+class RandomScheduler:
+    def select_vehicles(self, vehicles, target_count=10):
+        eligible_vehicles = [v for v in vehicles if not v['scheduled'] and v['sojourn_time'] >= 1.0]
+        if not eligible_vehicles:
+            return []
+        selected_count = min(target_count, len(eligible_vehicles))
+        return random.sample(eligible_vehicles, selected_count)
+
+def run_comparison(num_episodes=5, max_rounds=100):
+    """Run comparison between Mamba scheduler and random baseline"""
+    # Initialize environment
+    env = VehicleModelUpdateEnv(
+        max_vehicles=100,
+        target_performance=0.95,
+        max_rounds=max_rounds,
+        arrival_rate=0.7
+    )
+    
+    # Initialize schedulers
+    schedulers = {}
+    
+    # 1. Mamba Scheduler
+    mamba_model_path = "mamba_scheduler_models/mamba_scheduler_final.pt"
+    if os.path.exists(mamba_model_path):
+        try:
+            schedulers["Mamba"] = MambaSchedulerWrapper(mamba_model_path)
+            print("Loaded Mamba scheduler from checkpoint")
+        except Exception as e:
+            print(f"Error loading Mamba model: {e}")
+            print("Skipping Mamba scheduler")
+    else:
+        print("Mamba model checkpoint not found")
+        print("Skipping Mamba scheduler")
+    
+    # 2. Random Scheduler (baseline)
+    schedulers["Random"] = RandomScheduler()
+    
+    # Run comparison
+    results = {}
+    
+    for name, scheduler in schedulers.items():
+        print(f"Evaluating {name} scheduler...")
+        
+        episode_rewards = []
+        episode_performances = []
+        episode_lengths = []
+        decision_times = []
+        
+        for episode in range(num_episodes):
+            state = env.reset()
+            total_reward = 0
+            
+            for round_num in range(max_rounds):
+                # Get new vehicles
+                env.get_new_vehicles()
+                
+                # Make scheduling decision
+                start_time = time.time()
+                selected_vehicles = scheduler.select_vehicles(env.active_vehicles)
+                decision_time = (time.time() - start_time) * 1000  # ms
+                
+                # Take step in environment
+                selected_ids = [v['vehicle_id'] for v in selected_vehicles]
+                next_state, reward, done, _ = env.step(selected_ids)
+                
+                # Record metrics
+                total_reward += reward
+                decision_times.append(decision_time)
+                
+                # Update state
+                state = next_state
+                
+                if done:
+                    break
+            
+            # Record episode metrics
+            episode_rewards.append(total_reward)
+            episode_performances.append(state['current_model_performance'])
+            episode_lengths.append(state['current_round'])
+            
+            print(f"  Episode {episode+1}/{num_episodes}: Reward={total_reward:.2f}, "
+                  f"Performance={state['current_model_performance']:.4f}, "
+                  f"Length={state['current_round']}")
+        
+        # Compute average metrics
+        results[name] = {
+            'avg_reward': np.mean(episode_rewards),
+            'avg_performance': np.mean(episode_performances),
+            'avg_length': np.mean(episode_lengths),
+            'avg_decision_time': np.mean(decision_times),
+            'rewards': episode_rewards,
+            'performances': episode_performances,
+            'lengths': episode_lengths,
+            'decision_times': decision_times
+        }
+        
+        print(f"  Average Reward: {results[name]['avg_reward']:.2f}")
+        print(f"  Average Performance: {results[name]['avg_performance']:.4f}")
+        print(f"  Average Length: {results[name]['avg_length']:.1f}")
+        print(f"  Average Decision Time: {results[name]['avg_decision_time']:.2f} ms")
+        print()
+    
+    return results
+
+def plot_results(results):
+    """Plot comparison results"""
+    # Create timestamp for output files
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Plot metrics
+    metrics = ['avg_reward', 'avg_performance', 'avg_length', 'avg_decision_time']
+    titles = ['Average Reward', 'Average Performance', 'Average Episode Length', 'Average Decision Time (ms)']
+    ylabels = ['Reward', 'Performance', 'Rounds', 'Time (ms)']
+    
+    plt.figure(figsize=(15, 10))
+    
+    for i, (metric, title, ylabel) in enumerate(zip(metrics, titles, ylabels)):
+        plt.subplot(2, 2, i+1)
+        
+        values = [results[name][metric] for name in results]
+        plt.bar(results.keys(), values)
+        plt.title(title)
+        plt.ylabel(ylabel)
+        plt.xticks(rotation=45)
+        
+        # Add values on top of bars
+        for j, v in enumerate(values):
+            plt.text(j, v, f"{v:.2f}", ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"simple_comparison_{timestamp}.png"))
+    
+    # Plot performance over time for each scheduler
+    plt.figure(figsize=(10, 6))
+    for name in results:
+        plt.plot(results[name]['performances'], label=name)
+    
+    plt.title('Model Performance by Episode')
+    plt.xlabel('Episode')
+    plt.ylabel('Performance')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, f"simple_performance_comparison_{timestamp}.png"))
+    
+    # Plot decision time distribution
+    plt.figure(figsize=(10, 6))
+    plt.boxplot([results[name]['decision_times'] for name in results], labels=list(results.keys()))
+    plt.title('Decision Time Distribution')
+    plt.ylabel('Time (ms)')
+    plt.xticks(rotation=45)
+    plt.grid(True, axis='y')
+    plt.savefig(os.path.join(output_dir, f"simple_decision_time_comparison_{timestamp}.png"))
+    
+    # Save results to CSV
+    try:
+        import pandas as pd
+        summary = {name: {
+            'Avg Reward': results[name]['avg_reward'],
+            'Avg Performance': results[name]['avg_performance'],
+            'Avg Episode Length': results[name]['avg_length'],
+            'Avg Decision Time (ms)': results[name]['avg_decision_time']
+        } for name in results}
+        
+        df = pd.DataFrame(summary).T
+        df.to_csv(os.path.join(output_dir, f"simple_comparison_{timestamp}.csv"))
+    except ImportError:
+        print("pandas not installed, skipping CSV export")
+    
+    print(f"Results saved to {output_dir}")
+
+if __name__ == "__main__":
+    print("Starting simple scheduler comparison...")
+    
+    # Set random seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    
+    # Run comparison
+    results = run_comparison(num_episodes=5, max_rounds=100)
+    
+    # Plot results
+    plot_results(results)
+    
+    print("Comparison complete!")

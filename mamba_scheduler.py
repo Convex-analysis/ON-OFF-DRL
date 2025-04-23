@@ -28,7 +28,7 @@ else:
 
 class Vehicle:
     """Vehicle class representing a connected vehicle in the system"""
-    def __init__(self, vehicle_id, model_version, sojourn_time, compute_capacity, 
+    def __init__(self, vehicle_id, model_version, sojourn_time, compute_capacity,
                  data_quality, connectivity, vehicle_type):
         self.vehicle_id = vehicle_id
         self.model_version = model_version  # Current model version
@@ -39,17 +39,25 @@ class Vehicle:
         self.vehicle_type = vehicle_type    # Vehicle type/category
         self.arrival_time = None
         self.scheduled = False
-        
-    def to_tensor(self):
+        self._tensor = None  # Cache for tensor representation
+
+    def to_tensor(self, dtype=torch.float32):
         """Convert vehicle attributes to tensor for model input"""
-        return torch.tensor([
+        # Use cached tensor if available and dtype matches
+        if self._tensor is not None and self._tensor.dtype == dtype:
+            return self._tensor
+
+        # Create new tensor with specified dtype
+        self._tensor = torch.tensor([
             self.model_version,
             self.sojourn_time,
             self.compute_capacity,
             self.data_quality,
             self.connectivity,
             self.vehicle_type
-        ], dtype=torch.float32).to(device)
+        ], dtype=dtype).to(device)
+
+        return self._tensor
 
 class GlobalState:
     """Global state of the federated learning system"""
@@ -60,8 +68,8 @@ class GlobalState:
         self.scheduled_count = 0
         self.target_vehicle_count = 0
         self.performance_gap = 1.0  # Gap between current and target performance
-        
-    def to_tensor(self):
+
+    def to_tensor(self, dtype=torch.float32):
         """Convert global state to tensor for model input"""
         return torch.tensor([
             self.current_model_performance,
@@ -70,8 +78,8 @@ class GlobalState:
             self.scheduled_count,
             self.target_vehicle_count,
             self.performance_gap
-        ], dtype=torch.float32).to(device)
-    
+        ], dtype=dtype).to(device)
+
     def update(self, scheduled_vehicles):
         """Update global state based on scheduled vehicles"""
         self.scheduled_count += len(scheduled_vehicles)
@@ -97,13 +105,13 @@ class MambaActor(nn.Module):
     """
     def __init__(self, input_dim, state_dim, d_model=512, n_layers=4, d_state=16):
         super(MambaActor, self).__init__()
-        
+
         # Vehicle feature embedding
         self.vehicle_embedding = nn.Linear(input_dim, d_model)
-        
+
         # Global state embedding
         self.state_embedding = nn.Linear(state_dim, d_model)
-        
+
         # Mamba layers
         self.mamba_layers = nn.ModuleList([
             Mamba(
@@ -113,36 +121,39 @@ class MambaActor(nn.Module):
                 expand=2
             ) for _ in range(n_layers)
         ])
-        
+
         # Action head for vehicle selection probabilities
         self.action_head = nn.Linear(d_model, 1)
-        
+
     def forward(self, vehicles, global_state, mask=None):
         batch_size = len(vehicles)
-        
+
         # Embed global state
         state_embed = self.state_embedding(global_state)
-        
+
         # Embed vehicle features
         vehicle_embeds = torch.stack([self.vehicle_embedding(v) for v in vehicles])
-        
+
         # Concatenate state with each vehicle embedding
         state_expanded = state_embed.unsqueeze(0).expand(batch_size, -1)
         combined_embeds = vehicle_embeds + state_expanded
-        
+
         # Add sequence dimension for Mamba: (batch, dim) -> (1, batch, dim)
         x = combined_embeds.unsqueeze(0)  # shape: (1, batch, d_model)
         for mamba_layer in self.mamba_layers:
             x = mamba_layer(x)
         x = x.squeeze(0)  # shape: (batch, d_model)
-        
+
         # Generate selection probabilities
         logits = self.action_head(x).squeeze(-1)
-        
+
         # Apply mask if provided
         if mask is not None:
-            logits = logits.masked_fill(mask == 0, -1e9)
-        
+            # Use a smaller value for masking that's compatible with half-precision
+            # -65504 is the smallest representable value in float16
+            mask_value = -65504.0 if logits.dtype == torch.float16 else -1e9
+            logits = logits.masked_fill(mask == 0, mask_value)
+
         # Return selection probabilities
         return F.softmax(logits, dim=0)
 
@@ -155,13 +166,13 @@ class MambaCritic(nn.Module):
     """
     def __init__(self, input_dim, state_dim, d_model=384, n_layers=3, d_state=16):
         super(MambaCritic, self).__init__()
-        
+
         # Vehicle feature embedding
         self.vehicle_embedding = nn.Linear(input_dim, d_model)
-        
+
         # Global state embedding
         self.state_embedding = nn.Linear(state_dim, d_model)
-        
+
         # Mamba layers
         self.mamba_layers = nn.ModuleList([
             Mamba(
@@ -171,36 +182,36 @@ class MambaCritic(nn.Module):
                 expand=2
             ) for _ in range(n_layers)
         ])
-        
+
         # Value head
         self.value_head = nn.Sequential(
             nn.Linear(d_model, d_model // 2),
             nn.ReLU(),
             nn.Linear(d_model // 2, 1)
         )
-        
+
     def forward(self, vehicles, global_state):
         batch_size = len(vehicles)
-        
+
         # Embed global state
         state_embed = self.state_embedding(global_state)
-        
+
         # Embed vehicle features
         vehicle_embeds = torch.stack([self.vehicle_embedding(v) for v in vehicles])
-        
+
         # Concatenate state with each vehicle embedding
         state_expanded = state_embed.unsqueeze(0).expand(batch_size, -1)
         combined_embeds = vehicle_embeds + state_expanded
-        
+
         # Add sequence dimension for Mamba: (batch, dim) -> (1, batch, dim)
         x = combined_embeds.unsqueeze(0)  # shape: (1, batch, d_model)
         for mamba_layer in self.mamba_layers:
             x = mamba_layer(x)
         x = x.squeeze(0)  # shape: (batch, d_model)
-        
+
         # Pool vehicle representations
         x = torch.mean(x, dim=0)
-        
+
         # Output state value estimation
         return self.value_head(x)
 
@@ -218,46 +229,55 @@ class StreamingMambaScheduler:
         self.hidden_state = None
         self.global_state = GlobalState()
         self.max_vehicles = max_vehicles
-        
+
     def process_new_vehicle(self, vehicle):
         """Process single vehicle arrival efficiently"""
         vehicle.arrival_time = self.global_state.elapsed_time
         self.vehicle_cache.append(vehicle)
-        
+
         # Limit cache size by removing oldest vehicles if needed
         if len(self.vehicle_cache) > self.max_vehicles:
             self.vehicle_cache.pop(0)
-            
+
         return vehicle
-        
+
     def make_scheduling_decision(self, target_count=10):
         """Generate scheduling actions based on current state"""
         if not self.vehicle_cache:
             return []
-            
+
+        # Determine the dtype to use based on the actor's parameters
+        dtype = torch.float32
+        if hasattr(self.actor, 'parameters'):
+            try:
+                dtype = next(self.actor.parameters()).dtype
+            except StopIteration:
+                pass  # Use default dtype if no parameters
+
         # Create mask for vehicles that can't be scheduled (e.g., too short sojourn time)
-        mask = torch.ones(len(self.vehicle_cache)).to(device)
+        mask = torch.ones(len(self.vehicle_cache), dtype=dtype).to(device)
         for i, vehicle in enumerate(self.vehicle_cache):
             if vehicle.scheduled or vehicle.sojourn_time < 1.0:  # Minimum required time
                 mask[i] = 0
-                
+
         # Get selection probabilities from actor
-        vehicle_tensors = [v.to_tensor() for v in self.vehicle_cache]
-        global_state_tensor = self.global_state.to_tensor()
-        
+
+        vehicle_tensors = [v.to_tensor(dtype=dtype) for v in self.vehicle_cache]
+        global_state_tensor = self.global_state.to_tensor().to(dtype)
+
         with torch.no_grad():
             selection_probs = self.actor(vehicle_tensors, global_state_tensor, mask)
-        
+
         # Select vehicles based on probabilities
         selected_indices = []
         remaining_indices = list(range(len(self.vehicle_cache)))
         remaining_indices = [i for i in remaining_indices if mask[i] > 0]
-        
+
         # Select up to target_count vehicles
         for _ in range(min(target_count, len(remaining_indices))):
             if not remaining_indices:
                 break
-                
+
             # Normalize probabilities for remaining vehicles
             probs = selection_probs[remaining_indices]
             probs_sum = probs.sum().item()
@@ -277,16 +297,16 @@ class StreamingMambaScheduler:
             selected_idx = remaining_indices[idx]
             selected_indices.append(selected_idx)
             remaining_indices.remove(selected_idx)
-        
+
         # Mark selected vehicles as scheduled
         selected_vehicles = []
         for idx in selected_indices:
             self.vehicle_cache[idx].scheduled = True
             selected_vehicles.append(self.vehicle_cache[idx])
-            
+
         # Update global state
         self.global_state.update(selected_vehicles)
-        
+
         return selected_vehicles
 
 ################################## Implement Experience Replay Buffer ##################################
@@ -298,24 +318,24 @@ class EpisodicReplayMemory:
         self.buffer = deque(maxlen=self.num_episodes)
         self.buffer.append([])
         self.position = 0
-        
+
     def push(self, vehicles, global_state, actions, reward, next_vehicles, next_global_state, done):
         self.buffer[self.position].append((vehicles, global_state, actions, reward, next_vehicles, next_global_state, done))
         if done:
             self.buffer.append([])
             self.position = min(self.position + 1, self.num_episodes - 1)
-            
+
     def sample(self, batch_size, max_len=None):
         min_len = 0
         while min_len == 0:
             rand_episodes = random.sample(self.buffer, batch_size)
             min_len = min(len(episode) for episode in rand_episodes)
-            
+
         if max_len:
             max_len = min(max_len, min_len)
         else:
             max_len = min_len
-            
+
         episodes = []
         for episode in rand_episodes:
             if len(episode) > max_len:
@@ -324,9 +344,9 @@ class EpisodicReplayMemory:
                 rand_idx = 0
 
             episodes.append(episode[rand_idx:rand_idx+max_len])
-            
+
         return list(map(list, zip(*episodes)))
-    
+
     def __len__(self):
         return len(self.buffer)
 
@@ -336,11 +356,11 @@ def compute_returns(rewards, masks, gamma=0.99):
     """Compute discounted returns"""
     returns = torch.zeros_like(rewards)
     running_returns = 0
-    
+
     for t in reversed(range(len(rewards))):
         running_returns = rewards[t] + gamma * running_returns * masks[t]
         returns[t] = running_returns
-        
+
     return returns
 
 def train_mamba_scheduler(environment, num_episodes=1000, gamma=0.99, lr=1e-4):
@@ -353,37 +373,37 @@ def train_mamba_scheduler(environment, num_episodes=1000, gamma=0.99, lr=1e-4):
     # Initialize models
     vehicle_feature_dim = 6  # model_version, sojourn_time, compute_capacity, data_quality, connectivity, type
     global_state_dim = 6     # current_model_performance, round_number, elapsed_time, scheduled_count, target_count, performance_gap
-    
+
     actor = MambaActor(vehicle_feature_dim, global_state_dim).to(device)
     critic = MambaCritic(vehicle_feature_dim, global_state_dim).to(device)
-    
+
     # Initialize optimizers
     optimizer_actor = torch.optim.Adam(actor.parameters(), lr=lr)
     optimizer_critic = torch.optim.Adam(critic.parameters(), lr=lr)
-    
+
     # Initialize replay buffer
     replay_buffer = EpisodicReplayMemory(capacity=10000, max_episode_length=200)
-    
+
     # Training loop
     for episode in range(num_episodes):
         state = environment.reset()
         scheduler = StreamingMambaScheduler(actor, critic)
-        
+
         episode_rewards = []
         done = False
-        
+
         while not done:
             # Get new vehicles from environment
             new_vehicles = environment.get_new_vehicles()
             for vehicle in new_vehicles:
                 scheduler.process_new_vehicle(vehicle)
-                
+
             # Make scheduling decision
             selected_vehicles = scheduler.make_scheduling_decision()
-            
+
             # Take action in environment
             next_state, reward, done, info = environment.step(selected_vehicles)
-            
+
             # Store transition in replay buffer
             replay_buffer.push(
                 scheduler.vehicle_cache.copy(),
@@ -394,68 +414,69 @@ def train_mamba_scheduler(environment, num_episodes=1000, gamma=0.99, lr=1e-4):
                 scheduler.global_state,          # Next global state (updated after step)
                 done
             )
-            
+
             episode_rewards.append(reward)
-            
+
             # Update environment state
             state = next_state
-            
+
             # Perform experience replay
             if len(replay_buffer) > 1:
                 # Sample batch from replay buffer
                 batch = replay_buffer.sample(batch_size=16)
                 vehicles_batch, global_states_batch, actions_batch, rewards_batch, next_vehicles_batch, next_global_states_batch, dones_batch = batch
-                
+
                 # Convert to tensors
                 rewards = torch.tensor(rewards_batch, dtype=torch.float32).to(device)
                 masks = torch.tensor([1.0 - float(done) for done in dones_batch], dtype=torch.float32).to(device)
-                
+
                 # Compute returns
                 returns = compute_returns(rewards, masks, gamma)
-                
+
                 # Update critic
                 for i in range(len(vehicles_batch)):
                     value = critic(vehicles_batch[i], global_states_batch[i])
                     critic_loss = F.mse_loss(value, returns[i])
-                    
+
                     optimizer_critic.zero_grad()
                     critic_loss.backward()
                     optimizer_critic.step()
-                
+
                 # Update actor
                 for i in range(len(vehicles_batch)):
                     # Get action probabilities
                     probs = actor(vehicles_batch[i], global_states_batch[i])
-                    
+
                     # Compute advantage
                     value = critic(vehicles_batch[i], global_states_batch[i]).detach()
                     advantage = returns[i] - value
-                    
+
                     # Compute actor loss
                     action_log_probs = torch.log(probs)
                     actor_loss = -torch.mean(action_log_probs * advantage)
-                    
+
                     # Add entropy regularization
                     entropy = -torch.sum(probs * torch.log(probs + 1e-10))
                     actor_loss -= 0.01 * entropy  # Entropy coefficient
-                    
+
                     optimizer_actor.zero_grad()
                     actor_loss.backward()
                     optimizer_actor.step()
-        
+
         # Print episode statistics
         episode_reward = sum(episode_rewards)
         print(f"Episode {episode}, Total Reward: {episode_reward}")
-        
+
         # Save models periodically
         if episode % 100 == 0:
+            # Save model checkpoint
             torch.save({
                 'actor_state_dict': actor.state_dict(),
                 'critic_state_dict': critic.state_dict(),
                 'optimizer_actor_state_dict': optimizer_actor.state_dict(),
                 'optimizer_critic_state_dict': optimizer_critic.state_dict(),
             }, f'mamba_scheduler_checkpoint_{episode}.pt')
-    
+
     return actor, critic
 
 ################################## Optimize for Production Deployment ##################################
@@ -468,43 +489,64 @@ class OptimizedMambaScheduler:
     - Hardware-specific acceleration
     """
     def __init__(self, pretrained_model_path):
-        # Load pretrained model
-        checkpoint = torch.load(pretrained_model_path)
-        
         # Initialize models
         vehicle_feature_dim = 6
         global_state_dim = 6
-        
-        self.actor = MambaActor(vehicle_feature_dim, global_state_dim).to(device)
-        self.actor.load_state_dict(checkpoint['actor_state_dict'])
-        
+
+        # Use the same architecture as in training (d_model=256, n_layers=3, d_state=16)
+        self.actor = MambaActor(vehicle_feature_dim, global_state_dim, d_model=256, n_layers=3, d_state=16).to(device)
+
+        try:
+            # Load pretrained model with weights_only=True for security
+            checkpoint = torch.load(pretrained_model_path, weights_only=True)
+
+            # Load state dict if available
+            if 'actor_state_dict' in checkpoint:
+                self.actor.load_state_dict(checkpoint['actor_state_dict'])
+                print(f"Successfully loaded model from {pretrained_model_path}")
+            else:
+                print(f"Warning: Model file does not contain actor_state_dict. Using randomly initialized model.")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Using randomly initialized model instead.")
+
         # Quantize model for faster inference
         if device.type == 'cuda':
             self.actor = self.actor.half()  # Convert to FP16 for faster inference
-        
-        # JIT compile for faster execution
-        self.actor = torch.jit.script(self.actor)
-        
+
         # Set to evaluation mode
         self.actor.eval()
-        
+
+        # Note: JIT scripting is disabled because Mamba has compatibility issues with torch.jit
+
         # Initialize scheduler
         self.scheduler = StreamingMambaScheduler(self.actor, None)
-        
+
     def inference_mode_scheduling(self, vehicles, global_state, target_count=10):
         """Fast inference path for production"""
         # Update scheduler state
         self.scheduler.global_state = global_state
         self.scheduler.vehicle_cache = []
-        
+
         # Process vehicles
         for vehicle in vehicles:
             self.scheduler.process_new_vehicle(vehicle)
-            
+
         # Make scheduling decision
         with torch.no_grad():
+            # Store original dtype
+            original_dtype = None
+            if hasattr(self.actor, 'dtype'):
+                original_dtype = next(self.actor.parameters()).dtype
+
+            # Convert input tensors to match model dtype if needed
+            if original_dtype is not None and original_dtype != torch.float32:
+                # Temporarily convert vehicle tensors to match model dtype
+                for vehicle in self.scheduler.vehicle_cache:
+                    vehicle._tensor = None  # Clear cached tensor
+
             selected_vehicles = self.scheduler.make_scheduling_decision(target_count)
-            
+
         return selected_vehicles
 
 if __name__ == "__main__":
@@ -514,13 +556,13 @@ if __name__ == "__main__":
             self.time = 0
             self.vehicles = []
             self.global_state = GlobalState()
-            
+
         def reset(self):
             self.time = 0
             self.vehicles = []
             self.global_state = GlobalState()
             return self.global_state
-            
+
         def get_new_vehicles(self):
             # Simulate new vehicle arrivals
             new_vehicles = []
@@ -538,12 +580,12 @@ if __name__ == "__main__":
                     new_vehicles.append(vehicle)
                     self.vehicles.append(vehicle)
             return new_vehicles
-            
+
         def step(self, selected_vehicles):
             # Update time
             self.time += 1
             self.global_state.elapsed_time = self.time
-            
+
             # Calculate reward based on selected vehicles
             if selected_vehicles:
                 # Reward based on vehicle quality and diversity
@@ -552,32 +594,32 @@ if __name__ == "__main__":
                 reward = avg_quality * avg_compute * len(selected_vehicles) * 0.1
             else:
                 reward = 0
-                
+
             # Check if episode is done
             done = self.time >= 100 or self.global_state.current_model_performance >= 0.95
-            
+
             return self.global_state, reward, done, {}
-    
+
     # Create environment and train
     env = DummyEnvironment()
     actor, critic = train_mamba_scheduler(env, num_episodes=10)  # Reduced for testing
-    
+
     # Save final model
     torch.save({
         'actor_state_dict': actor.state_dict(),
         'critic_state_dict': critic.state_dict(),
     }, 'mamba_scheduler_final.pt')
-    
+
     # Test optimized scheduler
     optimized_scheduler = OptimizedMambaScheduler('mamba_scheduler_final.pt')
-    
+
     # Generate test vehicles
     test_vehicles = [
         Vehicle(1, 0.5, 5.0, 0.8, 0.9, 0.7, 1),
         Vehicle(2, 0.3, 3.0, 0.6, 0.7, 0.8, 2),
         Vehicle(3, 0.7, 7.0, 0.9, 0.8, 0.9, 0)
     ]
-    
+
     # Test scheduling
     test_global_state = GlobalState()
     selected = optimized_scheduler.inference_mode_scheduling(test_vehicles, test_global_state)
