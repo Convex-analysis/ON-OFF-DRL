@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Resolution Vehicular Federated Learning (MR-VFL) Environment
+Mobility Residient Vehicular Federated Learning (MR-VFL) Environment
 This environment simulates vehicles participating in federated learning with fairness constraints.
 """
 
 import numpy as np
 import random
 from collections import deque
-import torch
 
 class VehicularFLEnv:
     """

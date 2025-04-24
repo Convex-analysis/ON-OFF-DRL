@@ -509,31 +509,10 @@ class OptimizedMRVFLScheduler:
         # Set to evaluation mode
         self.actor.eval()
 
-        # Try to optimize with TorchScript
-        try:
-            # Create example inputs for tracing
-            example_vehicles = [torch.zeros(vehicle_feature_dim, dtype=torch.float32).to(device) for _ in range(5)]
-            example_global_state = torch.zeros(global_state_dim, dtype=torch.float32).to(device)
-            example_mask = torch.ones(5, dtype=torch.float32).to(device)
-            
-            # Trace the model
-            self.jit_actor = torch.jit.trace_module(
-                self.actor,
-                {"forward": (example_vehicles, example_global_state, example_mask)}
-            )
-            print("Successfully created TorchScript model for faster inference")
-            self.use_jit = True
-        except Exception as e:
-            print(f"Could not create TorchScript model: {e}")
-            print("Using regular PyTorch model")
-            self.use_jit = False
-
         # Try to use half precision if available
         if device.type == 'cuda':
             try:
                 self.actor = self.actor.half()
-                if self.use_jit:
-                    self.jit_actor = self.jit_actor.half()
                 print("Using half precision (FP16) for faster inference")
                 self.use_half = True
             except Exception as e:
@@ -543,7 +522,7 @@ class OptimizedMRVFLScheduler:
             self.use_half = False
 
         # Initialize scheduler
-        self.scheduler = StreamingMRVFLScheduler(self.actor if not self.use_jit else self.jit_actor)
+        self.scheduler = StreamingMRVFLScheduler(self.actor)
 
     def inference_mode_scheduling(self, vehicles, global_state, target_count=10):
         """Fast inference path for production"""
@@ -576,14 +555,21 @@ class OptimizedMRVFLScheduler:
         scheduler_vehicles = []
         for v in env_vehicles:
             if not v['scheduled']:
+                # Use fallback to support both 'model_version' and 'version'
+                model_version = v.get('model_version', v.get('version', 0.0))
+                sojourn_time = v.get('sojourn_time', v.get('sojourn', 0.0))
+                compute_capacity = v.get('compute_capacity', v.get('compute', 0.0))
+                data_quality = v.get('data_quality', v.get('quality', 0.0))
+                connectivity = v.get('connectivity', v.get('conn', 0.0))
+                vehicle_type = v.get('vehicle_type', v.get('type', 0))
                 vehicle = Vehicle(
-                    vehicle_id=v['vehicle_id'],
-                    model_version=v['model_version'],
-                    sojourn_time=v['sojourn_time'],
-                    compute_capacity=v['compute_capacity'],
-                    data_quality=v['data_quality'],
-                    connectivity=v['connectivity'],
-                    vehicle_type=v['vehicle_type']
+                    vehicle_id=v['id'],
+                    model_version=model_version,
+                    sojourn_time=sojourn_time,
+                    compute_capacity=compute_capacity,
+                    data_quality=data_quality,
+                    connectivity=connectivity,
+                    vehicle_type=vehicle_type
                 )
                 scheduler_vehicles.append(vehicle)
         
@@ -596,7 +582,7 @@ class OptimizedMRVFLScheduler:
         )
         
         # Convert back to environment vehicle format
-        return [v for v in env_vehicles if v['vehicle_id'] in [sv.vehicle_id for sv in selected_vehicles]]
+        return [v for v in env_vehicles if v['id'] in [sv.vehicle_id for sv in selected_vehicles]]
 
 # Example usage
 if __name__ == "__main__":

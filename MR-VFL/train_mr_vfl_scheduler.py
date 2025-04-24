@@ -91,7 +91,7 @@ def train_scheduler(args):
                 # Select action
                 try:
                     action = scheduler.select_action(state, available_mask)
-                    print(f"  Step {step+1}: Selected vehicle {action[0]} with params: {action[1:]}")
+                    #print(f"  Step {step+1}: Selected vehicle {action[0]} with params: {action[1:]}")
                 except Exception as e:
                     print(f"  Error selecting action: {e}")
                     raise
@@ -99,7 +99,7 @@ def train_scheduler(args):
                 # Take step in environment
                 try:
                     next_state, reward, done, info = env.step(action)
-                    print(f"  Step {step+1}: Reward = {reward:.4f}, Done = {done}")
+                    #print(f"  Step {step+1}: Reward = {reward:.4f}, Done = {done}")
                 except Exception as e:
                     print(f"  Error taking step in environment: {e}")
                     raise
@@ -115,7 +115,7 @@ def train_scheduler(args):
                 if scheduler.steps % scheduler.update_every == 0:
                     try:
                         scheduler.update()
-                        print(f"  Updated networks at step {scheduler.steps}")
+                        #print(f"  Updated networks at step {scheduler.steps}")
                     except Exception as e:
                         print(f"  Error updating networks: {e}")
                         raise
@@ -304,7 +304,7 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
 
     # Training parameters
-    parser.add_argument('--num_episodes', type=int, default=1000, help='Number of training episodes')
+    parser.add_argument('--num_episodes', type=int, default=100, help='Number of training episodes')
     parser.add_argument('--load_model', type=str, default=None, help='Path to pretrained model')
 
     # Evaluation parameters
