@@ -159,7 +159,7 @@ class VehicleModelUpdateEnv:
 
             # Performance increase depends on quality, compute capacity, and diminishing returns
             diminishing_factor = 1.0 - self.current_model_performance  # Harder to improve as we get better
-            performance_increase = 0.01 * avg_quality * avg_compute * diminishing_factor * len(selected_vehicles) / 10
+            performance_increase = 0.01 * avg_quality * diminishing_factor * len(selected_vehicles) / 10
 
             self.current_model_performance += performance_increase
             self.current_model_performance = min(1.0, self.current_model_performance)
