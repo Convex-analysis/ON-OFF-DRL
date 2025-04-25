@@ -33,21 +33,27 @@ class MLSchedulerWrapper:
     
     def select_vehicles(self, vehicles, target_count=10):
         # Convert environment vehicles to tensors
-        eligible_vehicles = [v for v in vehicles if not v['scheduled'] and v['sojourn_time'] >= 1.0]
+        eligible_vehicles = [v for v in vehicles if not v['scheduled'] and v.get('sojourn_time', v.get('sojourn', 0.0)) >= 1.0]
         
         if not eligible_vehicles:
             return []
         
-        # Create vehicle tensors
+        # Create vehicle tensors, supporting both 'model_version' and 'version' keys
         vehicle_tensors = []
         for v in eligible_vehicles:
+            model_version = v.get('model_version', v.get('version', 0.0))
+            sojourn_time = v.get('sojourn_time', v.get('sojourn', 0.0))
+            compute_capacity = v.get('compute_capacity', v.get('compute', 0.0))
+            data_quality = v.get('data_quality', v.get('quality', 0.0))
+            connectivity = v.get('connectivity', v.get('conn', 0.0))
+            vehicle_type = v.get('vehicle_type', v.get('type', 0))
             tensor = torch.tensor([
-                v['model_version'],
-                v['sojourn_time'],
-                v['compute_capacity'],
-                v['data_quality'],
-                v['connectivity'],
-                v['vehicle_type']
+                model_version,
+                sojourn_time,
+                compute_capacity,
+                data_quality,
+                connectivity,
+                vehicle_type
             ], dtype=torch.float32).to(device)
             vehicle_tensors.append(tensor)
         
@@ -59,7 +65,8 @@ class MLSchedulerWrapper:
         
         # Get selection probabilities
         with torch.no_grad():
-            selection_probs, _, _, _ = self.model(vehicle_tensors, global_state_tensor, mask)
+            # For MRVFLActor, do not pass global_state_tensor or mask
+            selection_probs, _, _, _ = self.model(torch.stack(vehicle_tensors))
         
         # Select vehicles based on probabilities
         selected_indices = []
@@ -113,12 +120,16 @@ class GreedyComputeScheduler:
         self.name = "Greedy-Compute"
     
     def select_vehicles(self, vehicles, target_count=10):
-        eligible_vehicles = [v for v in vehicles if not v['scheduled'] and v['sojourn_time'] >= 1.0]
+        eligible_vehicles = [v for v in vehicles if not v['scheduled'] and v.get('sojourn_time', v.get('sojourn', 0.0)) >= 1.0]
         if not eligible_vehicles:
             return []
         
-        # Sort by compute capacity
-        sorted_vehicles = sorted(eligible_vehicles, key=lambda v: v['compute_capacity'], reverse=True)
+        # Sort by compute capacity, supporting both 'compute_capacity' and 'computation_capacity'
+        sorted_vehicles = sorted(
+            eligible_vehicles,
+            key=lambda v: v.get('compute_capacity', v.get('computation_capacity', v.get('compute', 0.0))),
+            reverse=True
+        )
         return sorted_vehicles[:target_count]
 
 class FairnessAwareScheduler:
